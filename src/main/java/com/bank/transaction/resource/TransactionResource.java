@@ -3,6 +3,7 @@ package com.bank.transaction.resource;
 import com.bank.transaction.client.AccountRestClient;
 import com.bank.transaction.dto.TransactionRequestDTO;
 import com.bank.transaction.entity.Transaction;
+import jakarta.annotation.security.RolesAllowed;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
 import jakarta.validation.Valid;
@@ -25,6 +26,7 @@ public class TransactionResource {
     // RF3: Iniciar Transferencia
     @POST
     @Transactional
+    @RolesAllowed("ROLE_USER")
     public Response createTransaction(@Valid TransactionRequestDTO request) {
         if (request.sourceAccount().equals(request.targetAccount())) {
             return Response.status(Response.Status.BAD_REQUEST)
@@ -36,12 +38,13 @@ public class TransactionResource {
             accountClient.getAccountByNumber(request.sourceAccount());
             accountClient.getAccountByNumber(request.targetAccount());
         } catch (jakarta.ws.rs.WebApplicationException e) {
-            if (e.getResponse().getStatus() == 404) {
+            int statusCode = e.getResponse().getStatus(); // Capturamos el código real
+            if (statusCode == 404) {
                 return Response.status(Response.Status.BAD_REQUEST)
                         .entity("{\"error\":\"Una o ambas cuentas no existen\"}").build();
             }
             return Response.status(Response.Status.SERVICE_UNAVAILABLE)
-                    .entity("{\"error\":\"Error al validar cuentas\"}").build();
+                    .entity("{\"error\":\"Error al validar cuentas. El microservicio de cuentas devolvió HTTP " + statusCode + "\"}").build();
         }
 
         // 2. Registrar transacción PENDING
