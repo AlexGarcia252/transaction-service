@@ -14,6 +14,12 @@ import org.eclipse.microprofile.rest.client.inject.RestClient;
 import java.time.LocalDateTime;
 import java.util.List;
 
+// Importaciones para las Métricas (Micrometer)
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.annotation.PostConstruct;
+import java.util.concurrent.atomic.AtomicReference;
+
 @Path("/transactions")
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
@@ -23,12 +29,29 @@ public class TransactionResource {
     @RestClient
     AccountRestClient accountClient;
 
+    @Inject
+    MeterRegistry registry;
+
+    // Métricas (Contadores y Medidor)
+    private Counter successCounter;
+    private Counter failureCounter;
+    private AtomicReference<Double> totalAmountTransferred = new AtomicReference<>(0.0);
+
+    @PostConstruct
+    void initMetrics() {
+        // Inicializamos las métricas al arrancar el microservicio
+        successCounter = registry.counter("transfers.successful.count", "type", "transfer");
+        failureCounter = registry.counter("transfers.failed.count", "type", "transfer");
+        registry.gauge("transfers.total.amount", totalAmountTransferred, AtomicReference::get);
+    }
+
     // RF3: Iniciar Transferencia
     @POST
     @Transactional
     @RolesAllowed("ROLE_USER")
     public Response createTransaction(@Valid TransactionRequestDTO request) {
         if (request.sourceAccount().equals(request.targetAccount())) {
+            failureCounter.increment(); // Métrica de fallo
             return Response.status(Response.Status.BAD_REQUEST)
                     .entity("{\"error\":\"La cuenta origen y destino no pueden ser la misma\"}").build();
         }
@@ -38,13 +61,14 @@ public class TransactionResource {
             accountClient.getAccountByNumber(request.sourceAccount());
             accountClient.getAccountByNumber(request.targetAccount());
         } catch (jakarta.ws.rs.WebApplicationException e) {
-            int statusCode = e.getResponse().getStatus(); // Capturamos el código real
+            failureCounter.increment(); // Métrica de fallo
+            int statusCode = e.getResponse().getStatus();
             if (statusCode == 404) {
                 return Response.status(Response.Status.BAD_REQUEST)
                         .entity("{\"error\":\"Una o ambas cuentas no existen\"}").build();
             }
             return Response.status(Response.Status.SERVICE_UNAVAILABLE)
-                    .entity("{\"error\":\"Error al validar cuentas. El microservicio de cuentas devolvió HTTP " + statusCode + "\"}").build();
+                    .entity("{\"error\":\"Error al validar cuentas. El microservicio devolvió HTTP " + statusCode + "\"}").build();
         }
 
         // 2. Registrar transacción PENDING
@@ -62,21 +86,28 @@ public class TransactionResource {
             accountClient.debit(request.sourceAccount(), request.amount());
         } catch (jakarta.ws.rs.WebApplicationException e) {
             tx.status = "FAILED";
+            failureCounter.increment(); // Métrica de fallo
             return Response.status(Response.Status.BAD_REQUEST)
                     .entity("{\"error\":\"Saldo insuficiente o cuenta inválida\"}").build();
         }
 
-        // 4. Acreditar (Saga)
+        // 4. Acreditar (Saga: Compensación si falla)
         try {
             accountClient.credit(request.targetAccount(), request.amount());
         } catch (Exception e) {
+            // Revertimos el dinero (Compensación)
             accountClient.credit(request.sourceAccount(), request.amount());
             tx.status = "FAILED";
+            failureCounter.increment(); // Métrica de fallo
             return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
                     .entity("{\"error\":\"Fallo en el crédito. Se ha revertido el dinero a la cuenta origen.\"}").build();
         }
 
+        // 5. ¡ÉXITO TOTAL! Actualizamos estado y las métricas positivas
         tx.status = "COMPLETED";
+        successCounter.increment();
+        totalAmountTransferred.updateAndGet(v -> v + request.amount().doubleValue());
+
         return Response.status(Response.Status.CREATED).entity(tx).build();
     }
 
